@@ -642,6 +642,12 @@ export const ja = defineLocale({
       collapse: '折りたたむ',
       connectAnother: '別のプロバイダーを接続',
       otherProviders: 'その他のプロバイダー',
+      removeConfirm: provider => `${provider} を削除しますか？`,
+      removeExternal: (provider, command) => `${provider} は Hermes の外部で管理されています。${command} で削除してください。`,
+      removeKeyManaged: provider => `${provider} は API キーで設定されています。API Keys から削除してください。`,
+      removedTitle: 'アカウントを削除しました',
+      removedMessage: provider => `${provider} を削除しました。`,
+      failedRemove: provider => `${provider} を削除できませんでした`,
       noProviderKeys: '利用可能なプロバイダー API キーがありません。',
       loading: 'プロバイダーを読み込み中...'
     },
@@ -1834,6 +1840,7 @@ export const ja = defineLocale({
       moreOptions: 'その他の承認オプション',
       allowSession: 'このセッションで許可',
       alwaysAllowMenu: '常に許可…',
+      jumpToApproval: '承認が必要',
       reject: '拒否',
       alwaysTitle: 'このコマンドを常に許可しますか？',
       alwaysDescription: pattern =>

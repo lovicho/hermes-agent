@@ -621,6 +621,12 @@ export const zhHant = defineLocale({
       collapse: '收合',
       connectAnother: '連結其他提供方',
       otherProviders: '其他提供方',
+      removeConfirm: provider => `移除 ${provider}？`,
+      removeExternal: (provider, command) => `${provider} 由 Hermes 外部管理。請使用 ${command} 移除。`,
+      removeKeyManaged: provider => `${provider} 由 API 金鑰設定。請從 API Keys 中移除。`,
+      removedTitle: '帳號已移除',
+      removedMessage: provider => `${provider} 已移除。`,
+      failedRemove: provider => `無法移除 ${provider}`,
       noProviderKeys: '沒有可用的提供方 API 金鑰。',
       loading: '正在載入提供方...'
     },
@@ -1778,6 +1784,7 @@ export const zhHant = defineLocale({
       moreOptions: '更多核准選項',
       allowSession: '允許本工作階段',
       alwaysAllowMenu: '一律允許…',
+      jumpToApproval: '需要核准',
       reject: '拒絕',
       alwaysTitle: '一律允許此指令？',
       alwaysDescription: pattern =>
