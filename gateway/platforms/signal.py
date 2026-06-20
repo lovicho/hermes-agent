@@ -304,9 +304,15 @@ class SignalAdapter(BasePlatformAdapter):
         self._account_normalized = self.account.strip()
 
         # Track recently sent message timestamps to prevent echo-back loops
-        # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
+        # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds).
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
+        # Keep a separate bounded cache of outbound Signal message timestamps.
+        # Signal quote.id is the timestamp of the quoted message, so this lets
+        # inbound replies identify that the user replied to a message sent by
+        # this bot even after the self-sync echo was filtered above.
+        self._sent_message_timestamps: set[str] = set()
+        self._max_sent_message_timestamps = 500
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
         # phone number to the corresponding UUID when signal-cli prefers it.
@@ -615,10 +621,37 @@ class SignalAdapter(BasePlatformAdapter):
                 )
                 return
 
-        # Extract quote (reply-to) context from Signal dataMessage
+        # Strip the bot's own @mention from any group message so the agent
+        # doesn't misinterpret "@+155****4567 say hello" as a directive to
+        # contact that phone number. _render_mentions replaces the Signal
+        # ￼ placeholder with @<number-or-uuid>, which looks like an
+        # addressee to the LLM rather than a self-reference. Applies to every
+        # group (not just require_mention groups) so the self-mention is
+        # cleaned wherever it appears.
+        if is_group and text:
+            account_norm = self._account_normalized
+            if account_norm:
+                text = text.replace(f"@{account_norm}", "")
+                # Also strip if the mention was rendered using the bot's UUID
+                bot_uuid = self._recipient_uuid_by_number.get(account_norm)
+                if bot_uuid:
+                    text = text.replace(f"@{bot_uuid}", "")
+                # Tidy the spacing the removed mention left behind: collapse the
+                # double-space at a mid-sentence removal and trim the ends.
+                # Only touches the doubled space the removal introduced, so
+                # intentional newlines in a multi-line message are preserved.
+                text = text.replace("  ", " ").strip()
+
+        # Extract quote (reply-to) context from Signal dataMessage. Signal's
+        # quote.id is the timestamp of the quoted message; quote.author points
+        # at the quoted sender when available. Preserve both so the gateway can
+        # tell the agent when the user replied to a specific assistant message.
         quote_data = data_message.get("quote") or {}
         reply_to_id = str(quote_data.get("id")) if quote_data.get("id") else None
         reply_to_text = quote_data.get("text")
+        reply_to_author = self._extract_quote_author(quote_data)
+        reply_to_author_name = quote_data.get("authorName") or quote_data.get("authorProfileName")
+        reply_to_is_own = self._quote_references_own_message(reply_to_id, reply_to_author)
 
         # Process attachments
         attachments_data = data_message.get("attachments", [])
@@ -703,9 +736,16 @@ class SignalAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=timestamp,
-            raw_message={"sender": sender, "timestamp_ms": ts_ms},
+            raw_message={
+                "sender": sender,
+                "timestamp_ms": ts_ms,
+                "quote": quote_data if quote_data else None,
+            },
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author,
+            reply_to_author_name=reply_to_author_name,
+            reply_to_is_own_message=reply_to_is_own,
         )
 
         logger.debug("Signal: message from %s in %s: %s",
@@ -719,6 +759,51 @@ class SignalAdapter(BasePlatformAdapter):
             return
         self._recipient_uuid_by_number[number] = service_id
         self._recipient_number_by_uuid[service_id] = number
+
+    @staticmethod
+    def _extract_quote_author(quote_data: Any) -> Optional[str]:
+        """Return the best available Signal sender identifier from quote metadata."""
+        if not isinstance(quote_data, dict):
+            return None
+        for key in (
+            "author",
+            "authorNumber",
+            "authorUuid",
+            "authorAci",
+            "authorServiceId",
+            "authorServiceIdString",
+        ):
+            value = quote_data.get(key)
+            if value:
+                return str(value)
+        return None
+
+    def _quote_references_own_message(
+        self,
+        reply_to_id: Optional[str],
+        reply_to_author: Optional[str],
+    ) -> bool:
+        """True when a Signal quote points at this adapter's outbound message."""
+        if reply_to_id and str(reply_to_id) in self._sent_message_timestamps:
+            return True
+        if not reply_to_author:
+            return False
+        author = str(reply_to_author).strip()
+        if self._account_normalized and author == self._account_normalized:
+            return True
+        cached_uuid = self._recipient_uuid_by_number.get(self._account_normalized)
+        if cached_uuid and author == cached_uuid:
+            return True
+        cached_number = self._recipient_number_by_uuid.get(author)
+        return bool(cached_number and cached_number == self._account_normalized)
+
+    def _remember_sent_message_timestamp(self, timestamp: Any) -> None:
+        """Keep a bounded cache of outbound Signal timestamps for quote matching."""
+        if timestamp is None:
+            return
+        self._sent_message_timestamps.add(str(timestamp))
+        if len(self._sent_message_timestamps) > self._max_sent_message_timestamps:
+            self._sent_message_timestamps.pop()
 
     def _extract_contact_uuid(self, contact: Any, phone_number: str) -> Optional[str]:
         """Best-effort extraction of a Signal service ID from listContacts output."""
@@ -992,6 +1077,7 @@ class SignalAdapter(BasePlatformAdapter):
         ts = rpc_result.get("timestamp") if isinstance(rpc_result, dict) else None
         if ts:
             self._recent_sent_timestamps.add(ts)
+            self._remember_sent_message_timestamp(ts)
             if len(self._recent_sent_timestamps) > self._max_recent_timestamps:
                 self._recent_sent_timestamps.pop()
 
@@ -1395,8 +1481,29 @@ class SignalAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
-        # Reset per-chat typing backoff state so the next agent turn starts
-        # fresh rather than inheriting a cooldown from a prior conversation.
+
+        # Send an explicit stop-typing RPC so the recipient's device drops the
+        # indicator immediately instead of waiting for Signal's ~5s built-in
+        # timeout.  Failures are best-effort — the backoff state must still be
+        # cleared so the next agent turn starts clean.
+        try:
+            params: Dict[str, Any] = {"account": self.account}
+            if chat_id.startswith("group:"):
+                params["groupId"] = chat_id[6:]
+            else:
+                params["recipient"] = [await self._resolve_recipient(chat_id)]
+            params["stop"] = True
+            await self._rpc(
+                "sendTyping",
+                params,
+                rpc_id="typing-stop",
+                log_failures=False,
+            )
+        except Exception:
+            # Best-effort: any RPC failure (or recipient-resolution failure)
+            # must not prevent backoff cleanup.
+            pass
+
         self._typing_failures.pop(chat_id, None)
         self._typing_skip_until.pop(chat_id, None)
 
