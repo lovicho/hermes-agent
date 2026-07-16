@@ -45,7 +45,14 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { closeSessionTile, dropSessionState, openSessionTile, patchSessionTile, publishSessionState, type TileDock } from '@/store/session-states'
+import {
+  closeSessionTile,
+  dropSessionState,
+  openSessionTile,
+  patchSessionTile,
+  publishSessionState,
+  type TileDock
+} from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionResumeResponse, UsageStats } from '@/types/hermes'
@@ -76,6 +83,7 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   navigate: NavigateFunction
+  onFreshDraftRouteIntent?: () => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
@@ -155,6 +163,7 @@ export function useSessionActions({
   ensureSessionState,
   getRouteToken,
   navigate,
+  onFreshDraftRouteIntent,
   requestGateway,
   resetViewSync,
   runtimeIdByStoredSessionIdRef,
@@ -186,6 +195,11 @@ export function useSessionActions({
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
+      // Clear the durable route intent synchronously, before React Router
+      // publishes /new. Submit uses that intent to heal an existing-session
+      // rebind race, so leaving the old id here could revive it on a very fast
+      // New Chat -> Enter sequence.
+      onFreshDraftRouteIntent?.()
       navigate(NEW_CHAT_ROUTE, { replace: replaceRoute })
       setActiveSessionId(null)
       activeSessionIdRef.current = null
@@ -224,7 +238,7 @@ export function useSessionActions({
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
     },
-    [activeSessionIdRef, busyRef, navigate, resetViewSync, selectedStoredSessionIdRef]
+    [activeSessionIdRef, busyRef, navigate, onFreshDraftRouteIntent, resetViewSync, selectedStoredSessionIdRef]
   )
 
   const createBackendSessionForSend = useCallback(
@@ -536,6 +550,7 @@ export function useSessionActions({
       setFreshDraftReady(false)
       setActiveSessionId(null)
       activeSessionIdRef.current = null
+
       // A warm-cache hit at entry skipped the cold-path transcript clear, but the
       // warm path can still bail down to here — an empty-transcript drop, or the
       // cache getting purged during the profile-swap await — so the PREVIOUS
@@ -1067,13 +1082,7 @@ export function useSessionActions({
         notifyError(err, copy.archiveFailed)
       }
     },
-    [
-      copy,
-      runtimeIdByStoredSessionIdRef,
-      selectedStoredSessionId,
-      sessionStateByRuntimeIdRef,
-      startFreshSessionDraft
-    ]
+    [copy, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef, startFreshSessionDraft]
   )
 
   return {
