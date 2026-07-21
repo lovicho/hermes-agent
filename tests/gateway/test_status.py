@@ -844,6 +844,132 @@ class TestScopedLocks:
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
 
+    def test_acquire_scoped_lock_replaces_pid_recycled_with_valid_start_time(self, tmp_path, monkeypatch):
+        """macOS regression: PID recycled by unrelated process, but psutil returns a valid start_time.
+
+        On macOS, the lock record's start_time is None (no /proc at creation),
+        but psutil.Process(recycled_pid).create_time() returns a valid float
+        for the unrelated process that now owns the PID.  The old condition
+        required *both* sides to be None before falling back to cmdline
+        checking, so the recycled PID was never detected as stale.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 873,
+            "start_time": None,
+            "kind": "hermes-gateway",
+            "argv": ["/Users/user/.hermes/hermes-agent/hermes_cli/main.py", "gateway", "run", "--replace"],
+        }))
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        # psutil returns a valid create_time for the recycled PID
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1719500000)
+        monkeypatch.setattr(status, "_looks_like_gateway_process", lambda pid: False)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: "/usr/libexec/akd")
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+        assert payload["metadata"]["platform"] == "telegram"
+
+    def test_acquire_scoped_lock_atomic_removal_leaves_no_tombstone(self, tmp_path, monkeypatch):
+        """Stale lock removal renames to a tombstone then cleans it up — the
+        happy path must behave exactly like the old unlink()-based removal."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+        assert not (lock_path.parent / (lock_path.name + ".stale")).exists()
+
+    def test_acquire_scoped_lock_race_second_acquirer_loses(self, tmp_path, monkeypatch):
+        """Two racing starters both observe the same stale lock. The loser's
+        os.replace() hits FileNotFoundError (winner already claimed the stale
+        file) and the winner's FRESH lock must survive: the loser must fall
+        through to O_EXCL and lose, not clobber it like the old unlink() did."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        stale_record = {
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }
+        lock_path.write_text(json.dumps(stale_record))
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+
+        winner_record = {
+            "pid": 424242,
+            "start_time": 456,
+            "kind": "hermes-gateway",
+            "scope": "telegram-bot-token",
+        }
+        real_replace = os.replace
+
+        def racing_replace(src, dst, *args, **kwargs):
+            if str(src) == str(lock_path):
+                # Simulate the winner completing removal + O_EXCL create
+                # between our staleness check and our removal attempt.
+                lock_path.write_text(json.dumps(winner_record))
+                raise FileNotFoundError(2, "No such file or directory", str(src))
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(status.os, "replace", racing_replace)
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+
+        assert acquired is False
+        assert existing is not None
+        assert existing["pid"] == 424242
+        # The winner's fresh lock must be untouched on disk.
+        assert json.loads(lock_path.read_text())["pid"] == 424242
+
+    def test_acquire_scoped_lock_two_sequential_acquirers_one_winner(self, tmp_path, monkeypatch):
+        """Sequential end-to-end: first acquirer replaces a stale lock and
+        wins; a second acquirer (different identity, same lock file) sees the
+        first's LIVE lock and must lose without touching it."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: pid != 99999)
+
+        acquired1, _ = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+        assert acquired1 is True
+        first_payload = json.loads(lock_path.read_text())
+        assert first_payload["pid"] == os.getpid()
+
+        # Second acquirer: pretend the current record belongs to a different
+        # live process so the self-ownership fast path doesn't kick in.
+        rewritten = dict(first_payload)
+        rewritten["pid"] = 424242
+        lock_path.write_text(json.dumps(rewritten))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: rewritten.get("start_time"))
+        monkeypatch.setattr(status, "_looks_like_gateway_process", lambda pid: True)
+
+        acquired2, existing2 = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+        assert acquired2 is False
+        assert existing2 is not None and existing2["pid"] == 424242
+        assert json.loads(lock_path.read_text())["pid"] == 424242
+
     def test_acquire_scoped_lock_keeps_lock_when_cmdline_unreadable_but_record_is_gateway(self, tmp_path, monkeypatch):
         """Windows regression: ps unavailable so cmdline cannot be read.
 
@@ -1295,6 +1421,155 @@ class TestTakeoverMarker:
         assert not marker_path.exists()
 
 
+class TestScopedLockTakeover:
+    """Cross-home takeover requires explicit, corroborated process identity."""
+
+    @staticmethod
+    def _owner_record(target_home: Path, *, pid: int = 4242, start_time: int = 123):
+        target_home.mkdir(parents=True, exist_ok=True)
+        record = {
+            "pid": pid,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            "start_time": start_time,
+            "hermes_home": str(target_home),
+        }
+        (target_home / "gateway.pid").write_text(json.dumps(record))
+        return record
+
+    def test_verified_distinct_home_handoff_marks_target_before_sigterm(
+        self, tmp_path, monkeypatch
+    ):
+        replacer_home = tmp_path / "replacer"
+        target_home = tmp_path / "target"
+        replacer_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(replacer_home))
+        record = self._owner_record(target_home)
+
+        alive = iter([True, True, False])
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: next(alive))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 123)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "python -m hermes_cli.main gateway run",
+        )
+        calls = []
+
+        def terminate(pid, *, force=False):
+            marker_path = target_home / ".gateway-takeover.json"
+            assert marker_path.exists()
+            payload = json.loads(marker_path.read_text())
+            assert payload["target_hermes_home"] == str(target_home)
+            assert payload["replacer_hermes_home"] == str(replacer_home)
+            calls.append((pid, force))
+
+        monkeypatch.setattr(status, "terminate_pid", terminate)
+
+        owner_pid = status.take_over_scoped_lock_holder(
+            record, graceful_attempts=1
+        )
+
+        assert owner_pid == 4242
+        assert calls == [(4242, False)]
+        assert not (target_home / ".gateway-takeover.json").exists()
+        assert not (replacer_home / ".gateway-takeover.json").exists()
+
+    def test_handoff_rejects_uncorroborated_target_home(self, tmp_path, monkeypatch):
+        target_home = tmp_path / "target"
+        record = self._owner_record(target_home)
+        # The lock claims target_home, but that home's PID record names a
+        # different process identity.
+        bad_pid_record = dict(record, pid=9999)
+        (target_home / "gateway.pid").write_text(json.dumps(bad_pid_record))
+
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 123)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "python -m hermes_cli.main gateway run",
+        )
+        calls = []
+        monkeypatch.setattr(
+            status, "terminate_pid", lambda *args, **kwargs: calls.append(args)
+        )
+
+        assert status.take_over_scoped_lock_holder(record) is None
+        assert calls == []
+        assert not (target_home / ".gateway-takeover.json").exists()
+
+    def test_handoff_requires_marker_write_before_termination(
+        self, tmp_path, monkeypatch
+    ):
+        target_home = tmp_path / "target"
+        record = self._owner_record(target_home)
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 123)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "python -m hermes_cli.main gateway run",
+        )
+        monkeypatch.setattr(status, "write_takeover_marker", lambda *a, **k: False)
+        calls = []
+        monkeypatch.setattr(
+            status, "terminate_pid", lambda *args, **kwargs: calls.append(args)
+        )
+
+        assert status.take_over_scoped_lock_holder(record) is None
+        assert calls == []
+
+    def test_pid_reuse_after_sigterm_is_never_force_killed(
+        self, tmp_path, monkeypatch
+    ):
+        target_home = tmp_path / "target"
+        record = self._owner_record(target_home)
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        starts = iter([123, 123, 999])
+        monkeypatch.setattr(
+            status, "_get_process_start_time", lambda _pid: next(starts)
+        )
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "python -m hermes_cli.main gateway run",
+        )
+        calls = []
+        monkeypatch.setattr(
+            status,
+            "terminate_pid",
+            lambda pid, *, force=False: calls.append((pid, force)),
+        )
+
+        assert status.take_over_scoped_lock_holder(
+            record, graceful_attempts=1
+        ) == 4242
+        assert calls == [(4242, False)]
+
+    def test_target_accepts_verified_cross_home_marker(self, tmp_path, monkeypatch):
+        replacer_home = tmp_path / "replacer"
+        target_home = tmp_path / "target"
+        replacer_home.mkdir()
+        target_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(replacer_home))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 100)
+
+        assert status.write_takeover_marker(
+            os.getpid(),
+            target_home=target_home,
+            target_start_time=100,
+        ) is True
+        assert not (replacer_home / ".gateway-takeover.json").exists()
+        assert (target_home / ".gateway-takeover.json").exists()
+
+        # The target process reads its own home.  A differing replacer home is
+        # valid only because the marker explicitly names this target home.
+        monkeypatch.setenv("HERMES_HOME", str(target_home))
+        assert status.consume_takeover_marker_for_self() is True
+        assert not (target_home / ".gateway-takeover.json").exists()
+
+
 class TestPlannedStopMarker:
     """Tests for intentional service/manual gateway stop markers."""
 
@@ -1721,3 +1996,111 @@ class TestLaunchdPlistRespawnGovernance:
         assert "<key>ThrottleInterval</key>" in plist
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
+
+
+class TestPermissionErrorOnLockFile:
+    """Stale root-owned lock files from launchd Background sessions must not
+    crash the gateway on restart (issue #42685)."""
+
+    def test_permission_error_on_lock_file_returns_false_and_removes(self, tmp_path, monkeypatch):
+        """When the lock file is not writable (root-owned), the function should
+        remove the stale file and report the lock as inactive."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.write_text("stale", encoding="utf-8")
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if str(path) == str(lock_path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+
+        result = status.is_gateway_runtime_lock_active(lock_path)
+        assert result is False
+        assert not lock_path.exists(), "stale root-owned lock file should be removed"
+
+    def test_permission_error_unlink_failure_still_returns_false(self, tmp_path, monkeypatch):
+        """Even if unlinking the stale lock file fails (e.g. directory not writable),
+        the function should still return False to allow startup."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.write_text("stale", encoding="utf-8")
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if str(path) == str(lock_path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        real_unlink = Path.unlink
+
+        def deny_unlink(self, *args, **kwargs):
+            if str(self) == str(lock_path):
+                raise OSError(13, "Permission denied", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+        monkeypatch.setattr(Path, "unlink", deny_unlink)
+
+        result = status.is_gateway_runtime_lock_active(lock_path)
+        assert result is False
+
+    def test_acquire_gateway_runtime_lock_recovers_from_permission_error(self, tmp_path, monkeypatch):
+        """acquire_gateway_runtime_lock must survive a stale root-owned lock
+        file: unlink it and retry with a fresh file instead of crashing."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = status._get_gateway_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("stale", encoding="utf-8")
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            # Simulate a root-owned file: opening fails while the ORIGINAL
+            # stale file is still on disk; after unlink, the fresh file the
+            # retry creates opens fine.
+            if (
+                str(path) == str(lock_path)
+                and lock_path.exists()
+                and lock_path.read_text(encoding="utf-8") == "stale"
+            ):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+
+        try:
+            assert status.acquire_gateway_runtime_lock() is True
+        finally:
+            status.release_gateway_runtime_lock()
+
+    def test_acquire_gateway_runtime_lock_gives_up_when_unlink_denied(self, tmp_path, monkeypatch):
+        """If the stale lock cannot even be unlinked, acquisition fails
+        cleanly (returns False) rather than raising."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = status._get_gateway_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("stale", encoding="utf-8")
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if str(path) == str(lock_path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        real_unlink = Path.unlink
+
+        def deny_unlink(self, *args, **kwargs):
+            if str(self) == str(lock_path):
+                raise OSError(13, "Permission denied", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+        monkeypatch.setattr(Path, "unlink", deny_unlink)
+
+        assert status.acquire_gateway_runtime_lock() is False
