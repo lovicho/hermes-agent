@@ -1447,6 +1447,73 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     return list(global_entries) if isinstance(global_entries, list) else []
 
 
+_POOL_STATUS_FIELDS = (
+    "last_status",
+    "last_status_at",
+    "last_error_code",
+    "last_error_reason",
+    "last_error_message",
+    "last_error_reset_at",
+)
+
+
+def _merge_disk_cooldown_state(
+    entry: Dict[str, Any],
+    disk_entry: Optional[Dict[str, Any]],
+    provider_id: str,
+) -> Dict[str, Any]:
+    """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
+
+    ``write_credential_pool`` callers persist an in-memory snapshot that may
+    predate another process marking the same credential exhausted or dead
+    (last-writer-wins lost update).  Without this merge, process B's later
+    rewrite resurrects a rate-limited key as healthy and both processes
+    resume hammering it.  Adopt the on-disk status fields only when they are
+    strictly more recent (by ``last_status_at``) AND still binding — a DEAD
+    marker, or an EXHAUSTED cooldown that has not yet expired.  Expired
+    cooldowns are not resurrected, so the pool's own expiry-clear (which
+    resets ``last_status_at`` to None) is never overridden.
+    """
+    if not isinstance(disk_entry, dict):
+        return entry
+    try:
+        from agent.credential_pool import (
+            PooledCredential,
+            STATUS_DEAD,
+            STATUS_EXHAUSTED,
+            _exhausted_until,
+            _parse_absolute_timestamp,
+        )
+
+        disk_status = disk_entry.get("last_status")
+        if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
+            return entry
+        # A token change means the caller re-authed/refreshed this entry and
+        # intentionally cleared its status (e.g. _sync_codex_entry_from_
+        # auth_store after a fresh device-code login) — never resurrect the
+        # old cooldown onto fresh credentials.
+        mem_access = entry.get("access_token") or ""
+        disk_access = disk_entry.get("access_token") or ""
+        if mem_access and disk_access and mem_access != disk_access:
+            return entry
+        disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+        mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
+        if disk_ts <= mem_ts:
+            return entry
+        if disk_status == STATUS_EXHAUSTED:
+            until = _exhausted_until(
+                PooledCredential.from_dict(provider_id, disk_entry)
+            )
+            if until is None or until <= time.time():
+                return entry
+        merged_entry = dict(entry)
+        for status_field in _POOL_STATUS_FIELDS:
+            merged_entry[status_field] = disk_entry.get(status_field)
+        return merged_entry
+    except Exception:  # pragma: no cover - best-effort merge
+        return entry
+
+
 def write_credential_pool(
     provider_id: str,
     entries: List[Dict[str, Any]],
@@ -1463,6 +1530,10 @@ def write_credential_pool(
     disk but missing from ``entries``. Those were added by another process after
     the caller loaded its in-memory snapshot; without this merge a later
     rotation/exhaustion rewrite drops the concurrent credential.
+
+    For entries present on BOTH sides, status fields are merged by
+    ``last_status_at`` recency via ``_merge_disk_cooldown_state`` so a stale
+    snapshot cannot erase a cooldown/quarantine another process just wrote.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
@@ -1481,12 +1552,24 @@ def write_credential_pool(
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
+        existing_by_id = {
+            entry.get("id"): entry
+            for entry in existing_list
+            if isinstance(entry, dict) and entry.get("id")
+        }
         new_ids = {
             entry.get("id")
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
-        merged: List[Dict[str, Any]] = list(sanitized_entries)
+        merged: List[Dict[str, Any]] = [
+            _merge_disk_cooldown_state(
+                entry, existing_by_id.get(entry.get("id")), provider_id
+            )
+            if isinstance(entry, dict)
+            else entry
+            for entry in sanitized_entries
+        ]
         for disk_entry in existing_list:
             if not isinstance(disk_entry, dict):
                 continue
@@ -1588,7 +1671,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     except Exception:
         pass
 
-    # 2. Check config.yaml model.provider
+    # 2. Check config.yaml model.provider and other explicit provider slots.
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -1597,6 +1680,37 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             cfg_provider = (model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == normalized:
                 return True
+
+        # MoA presets are explicit model selections too.  A user who configured
+        # ``provider: anthropic`` as a MoA advisor/aggregator has opted Hermes
+        # into using Anthropic credentials for that slot even when the main
+        # session model is another provider.  Without this, Claude Code OAuth
+        # entries are pruned/ignored by credential_pool.load_pool("anthropic"),
+        # so MoA Anthropic advisors fail with "no ANTHROPIC_API_KEY" while the
+        # normal model picker says Anthropic is logged in.
+        def _slot_matches_provider(slot):
+            return (
+                isinstance(slot, dict)
+                and (slot.get("provider") or "").strip().lower() == normalized
+            )
+
+        moa_cfg = cfg.get("moa")
+        if isinstance(moa_cfg, dict):
+            for slot in moa_cfg.get("reference_models") or []:
+                if _slot_matches_provider(slot):
+                    return True
+            if _slot_matches_provider(moa_cfg.get("aggregator")):
+                return True
+            presets = moa_cfg.get("presets")
+            if isinstance(presets, dict):
+                for preset in presets.values():
+                    if not isinstance(preset, dict):
+                        continue
+                    for slot in preset.get("reference_models") or []:
+                        if _slot_matches_provider(slot):
+                            return True
+                    if _slot_matches_provider(preset.get("aggregator")):
+                        return True
     except Exception:
         pass
 
@@ -7034,9 +7148,15 @@ def _prompt_model_selection(
     If *unavailable_models* is provided, those models are shown grayed out
     and unselectable, with an upgrade link to *portal_url*.
     """
-    from hermes_cli.models import _format_price_per_mtok
+    from hermes_cli.models import (
+        _format_price_per_mtok,
+        compute_sale_discount,
+    )
 
     _unavailable = unavailable_models or []
+    # Sale chrome (★ / -N% / was) is Nous Portal-only — never for OpenRouter
+    # or other providers even if pricing.original is somehow present.
+    sale_chrome = (confirm_provider or "").strip().lower() == "nous"
 
     def _confirmed_selection(mid: str) -> Optional[str]:
         if not mid:
@@ -7063,16 +7183,31 @@ def _prompt_model_selection(
 
     # Column-aligned labels when pricing is available
     has_pricing = bool(pricing and any(pricing.get(m) for m in all_models))
-    name_col = max((len(m) for m in all_models), default=0) + 2 if has_pricing else 0
+    # Leave room for a leading "★ " on sale rows (Nous only).
+    name_pad = 3 if sale_chrome else 2
+    name_col = (
+        max((len(m) for m in all_models), default=0) + name_pad
+        if has_pricing
+        else 0
+    )
 
-    # Pre-compute formatted prices and dynamic column widths
-    _price_cache: dict[str, tuple[str, str, str]] = {}
+    # Pre-compute formatted prices and sale chrome.
+    # (inp, out, cache, pct|None, was_inp, was_out)
+    # Sale chrome is drawn as curses/ANSI segments (yellow % / dim "was"),
+    # not baked into a single plain string — curses addnstr would otherwise
+    # render escape bytes literally.
+    _price_cache: dict[str, tuple[str, str, str, int | None, str, str]] = {}
     price_col = 3  # minimum width
     cache_col = 0  # only set if any model has cache pricing
     has_cache = False
+    any_on_sale = False
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
     if has_pricing:
         for mid in all_models:
             p = pricing.get(mid)  # type: ignore[union-attr]
+            pct: int | None = None
+            was_inp = was_out = ""
             if p:
                 inp = _format_price_per_mtok(p.get("prompt", ""))
                 out = _format_price_per_mtok(p.get("completion", ""))
@@ -7080,26 +7215,68 @@ def _prompt_model_selection(
                 cache = _format_price_per_mtok(cache_read) if cache_read else ""
                 if cache:
                     has_cache = True
+                if sale_chrome:
+                    sale = compute_sale_discount(
+                        p.get("prompt", ""),
+                        p.get("completion", ""),
+                        p.get("original"),
+                    )
+                    if sale is not None:
+                        any_on_sale = True
+                        pct, was_prompt_raw, was_out_raw = sale
+                        was_inp = (
+                            _format_price_per_mtok(was_prompt_raw)
+                            if was_prompt_raw != ""
+                            else "?"
+                        )
+                        was_out = (
+                            _format_price_per_mtok(was_out_raw)
+                            if was_out_raw != ""
+                            else "?"
+                        )
             else:
                 inp, out, cache = "", "", ""
-            _price_cache[mid] = (inp, out, cache)
+            _price_cache[mid] = (inp, out, cache, pct, was_inp, was_out)
             price_col = max(price_col, len(inp), len(out))
             cache_col = max(cache_col, len(cache))
         if has_cache:
             cache_col = max(cache_col, 5)  # minimum: "Cache" header
 
-    def _label(mid):
-        if has_pricing:
-            inp, out, cache = _price_cache.get(mid, ("", "", ""))
-            price_part = f" {inp:>{price_col}}  {out:>{price_col}}"
-            if has_cache:
-                price_part += f"  {cache:>{cache_col}}"
-            base = f"{mid:<{name_col}}{price_part}"
+    def _label_segments(mid):
+        """Build a rich radiolist row: yellow ★/% , dim was, plain prices."""
+        if not has_pricing:
+            segs: list[tuple[str, str | None]] = [(mid, None)]
+            if mid == current_model:
+                segs.append(("  ← currently in use", None))
+            return segs
+
+        inp, out, cache, pct, was_inp, was_out = _price_cache.get(
+            mid, ("", "", "", None, "", "")
+        )
+        on_sale = pct is not None
+        # Reserve 2 columns for "★ " so sale and non-sale names share alignment.
+        star_w = 2
+        if on_sale:
+            name_segs: list[tuple[str, str | None]] = [
+                ("★ ", "yellow"),
+                (f"{mid:<{name_col - star_w}}", None),
+            ]
         else:
-            base = mid
+            name_segs = [(f"{mid:<{name_col}}", None)]
+
+        price_part = f" {inp:>{price_col}}  {out:>{price_col}}"
+        if has_cache:
+            price_part += f"  {cache:>{cache_col}}"
+        segs = [*name_segs, (price_part, None)]
+        if on_sale:
+            segs.append((f"  -{pct}%", "yellow"))
+            segs.append((f"  was {was_inp}/{was_out}", "dim"))
         if mid == current_model:
-            base += "  ← currently in use"
-        return base
+            segs.append(("  ← currently in use", None))
+        return segs
+
+    def _label(mid):
+        return "".join(text for text, _style in _label_segments(mid))
 
     # Default cursor on the current model (index 0 if it was reordered to top)
     default_idx = 0
@@ -7114,11 +7291,11 @@ def _prompt_model_selection(
         header = f"\n{pad}{'':>{name_col}} {'In':>{price_col}}  {'Out':>{price_col}}"
         if has_cache:
             header += f"  {'Cache':>{cache_col}}"
-        menu_title += header + "  /Mtok"
-
-    # ANSI escape for dim text
-    _DIM = "\033[2m"
-    _RESET = "\033[0m"
+        # Legend lives on the column-header line so it reads as a key
+        # (★ = on sale), not a fake menu row.
+        menu_title += header + "  $/Mtok"
+        if any_on_sale:
+            menu_title += "  ★ = on sale"
 
     # Try arrow-key menu first, fall back to number input.
     # Uses the shared curses radiolist (ESC/arrow-key handling that works
@@ -7128,7 +7305,7 @@ def _prompt_model_selection(
     try:
         from hermes_cli.curses_ui import curses_radiolist
 
-        choices = [_label(mid) for mid in ordered]
+        choices = [_label_segments(mid) for mid in ordered]
         choices.append("Enter custom model name")
         choices.append("Skip (keep current)")
 
@@ -7142,8 +7319,8 @@ def _prompt_model_selection(
         # screen clear. menu_title already embeds the aligned price header.
         desc_lines: list[str] = []
         if has_pricing:
-            # menu_title is "Select default model:\n<pad><header>  /Mtok"
-            # Keep only the header portion for the description.
+            # menu_title is "Select default model:\n<pad><header>  $/Mtok\n…"
+            # Keep only the header/legend portion for the description.
             header_part = menu_title.split("\n", 1)
             if len(header_part) > 1:
                 desc_lines.extend(header_part[1].splitlines())
@@ -7176,11 +7353,18 @@ def _prompt_model_selection(
     except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
         pass
 
-    # Fallback: numbered list
-    print(menu_title)
+    # Fallback: numbered list (ANSI colors for sale chrome)
+    from hermes_cli.curses_ui import format_radio_item_ansi
+    from hermes_cli.colors import Colors, color
+
+    for line in menu_title.splitlines():
+        if "★" in line:
+            print(line.replace("★", color("★", Colors.YELLOW), 1))
+        else:
+            print(line)
     num_width = len(str(len(ordered) + 2))
     for i, mid in enumerate(ordered, 1):
-        print(f"  {i:>{num_width}}. {_label(mid)}")
+        print(f"  {i:>{num_width}}. {format_radio_item_ansi(_label_segments(mid))}")
     n = len(ordered)
     print(f"  {n + 1:>{num_width}}. Enter custom model name")
     print(f"  {n + 2:>{num_width}}. Skip (keep current)")
