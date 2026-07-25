@@ -1763,15 +1763,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
 
-            try:
-                worker = _SlashWorker(
-                    key,
-                    getattr(agent, "model", _resolve_model()),
-                    profile_home=current.get("profile_home"),
-                )
-                _attach_worker(sid, current, worker)
-            except Exception:
-                pass
+            # No eager slash-worker pre-warm: slash.exec spawns one on demand
+            # (its error path already relies on that respawn to recover from a
+            # dead worker). Each worker child runs its own MCP discovery
+            # (#61891), so pre-warming one per session forks the full stdio
+            # MCP fleet — ~20 OS processes per retained session on a config
+            # with a few stdio servers — even for sessions that never run a
+            # worker-routed command. Sessions held by a live transport are
+            # never reaped, so with the desktop app open for days those
+            # fleets accumulate until the OS refuses new process spawns.
 
             try:
                 from tools.approval import (
@@ -3393,11 +3393,16 @@ def _tool_lifecycle_required_for_ui(name: str) -> bool:
 
 def _restart_slash_worker(sid: str, session: dict):
     worker = session.get("slash_worker")
-    if worker:
-        try:
-            worker.close()
-        except Exception:
-            pass
+    # A session that never spawned a worker has nothing stale to replace —
+    # the next slash.exec builds one with the current session key/model.
+    # Spawning here would fork the per-worker stdio MCP fleet for sessions
+    # that never use worker-routed commands.
+    if worker is None:
+        return
+    try:
+        worker.close()
+    except Exception:
+        pass
     try:
         new_worker = _SlashWorker(
             session["session_key"],
@@ -5631,19 +5636,10 @@ def _init_session(
             except Exception:
                 pass
     _register_session_cwd(_sessions[sid])
-    try:
-        _attach_worker(
-            sid,
-            _sessions[sid],
-            _SlashWorker(
-                key,
-                getattr(agent, "model", _resolve_model()),
-                profile_home=_sessions[sid].get("profile_home"),
-            ),
-        )
-    except Exception:
-        # Defer hard-failure to slash.exec; chat still works without slash worker.
-        _sessions[sid]["slash_worker"] = None
+    # No eager slash-worker pre-warm — the session dict already carries
+    # slash_worker=None and slash.exec builds one on demand. See the
+    # deferred-build path in _start_agent_build for the full rationale
+    # (per-worker MCP fleets accumulating across retained sessions).
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
@@ -5741,6 +5737,49 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     if prefix:
         return f"{prefix}\n\n{text}" if text else prefix
     return text or "What do you see in this image?"
+
+
+def _build_persist_message_with_image_refs(user_text: str, image_paths: list[str]) -> str:
+    """Build the clean, UI-recognizable version of the user's message for
+    persisting to session history. Uses ``@image:<path>`` directives — the
+    format the desktop client (directive-text.tsx / HERMES_DIRECTIVE_RE)
+    actually parses and renders as an image — unlike
+    ``_enrich_with_attached_images``, which embeds a vision description and
+    an ``image_url:`` hint meant only for the model and must never be
+    persisted as-is (it silently breaks image rendering after a full
+    restart, and reorders image/text on live session-switch reconciliation).
+
+    The caption leads and the directives trail: session previews are the first
+    60 characters of the first user message (``list_sessions_rich``), so a
+    leading directive would label the session with a truncated file path in the
+    sidebar, switcher, and command palette. Clients lift the refs out of the
+    body by line, so their position does not affect how the turn renders.
+    """
+    from agent.context_references import format_reference_value
+
+    text = user_text or ""
+    refs = "\n".join(f"@image:{format_reference_value(p)}" for p in image_paths if Path(p).exists())
+    if not refs:
+        return text
+    return f"{text}\n{refs}" if text else refs
+
+
+def _build_persist_user_message(user_text: str, image_paths: list[str], run_message: Any) -> Any:
+    """Shape the persisted user turn to match what was sent to the model.
+
+    Native-vision turns send ``content`` as a parts list, and
+    ``_flush_messages_to_session_db`` deliberately ignores a plain-string
+    override for a list payload (a text override must not erase a turn's
+    image/audio summary). So mirror the shape: replace only the text part with
+    the ``@image:`` ref form and keep the image parts, so the model still has
+    the pixels for the rest of the session. Any API-only text part (the
+    barge-in note) is dropped along the way, which is the point of the override.
+    """
+    persist_text = _build_persist_message_with_image_refs(user_text, image_paths)
+    if not isinstance(run_message, list):
+        return persist_text
+    image_parts = [p for p in run_message if not (isinstance(p, dict) and p.get("type") == "text")]
+    return [{"type": "text", "text": persist_text}, *image_parts]
 
 
 def _content_display_text(content: Any) -> str:
@@ -11001,6 +11040,9 @@ def _run_prompt_submit(
             run_kwargs = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
+                "persist_user_message": (
+                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                ),
             }
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
@@ -16068,15 +16110,26 @@ def _(rid, params: dict) -> dict:
 
     worker = session.get("slash_worker")
     if not worker:
-        try:
-            worker = _SlashWorker(
-                session["session_key"],
-                getattr(session.get("agent"), "model", _resolve_model()),
-                profile_home=session.get("profile_home"),
-            )
-            _attach_worker(params.get("session_id", ""), session, worker)
-        except Exception as e:
-            return _err(rid, 5030, f"slash worker start failed: {e}")
+        # On-demand spawn is now the ONLY spawn path for a fresh session
+        # (eager pre-warm removed), and slash.exec handlers run on the RPC
+        # thread pool — two concurrent slash commands on the same session
+        # could both observe slash_worker=None and each fork a full
+        # MCP-fleet worker (the loser of the _attach_worker race would leak
+        # unclosed). Serialize first-use spawn per session.
+        with _sessions_lock:
+            spawn_lock = session.setdefault("_slash_spawn_lock", threading.Lock())
+        with spawn_lock:
+            worker = session.get("slash_worker")
+            if not worker:
+                try:
+                    worker = _SlashWorker(
+                        session["session_key"],
+                        getattr(session.get("agent"), "model", _resolve_model()),
+                        profile_home=session.get("profile_home"),
+                    )
+                    _attach_worker(params.get("session_id", ""), session, worker)
+                except Exception as e:
+                    return _err(rid, 5030, f"slash worker start failed: {e}")
 
     try:
         output = worker.run(cmd)
