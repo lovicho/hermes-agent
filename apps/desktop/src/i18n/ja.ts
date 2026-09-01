@@ -1157,7 +1157,17 @@ export const ja = defineLocale({
         enabledMessage: '新しいセッションは既定ブラウザプロファイルのスナップショットでブラウジングします。',
         disabledTitle: '実プロファイルブラウジング：オフ',
         disabledMessage: 'プロファイルのスナップショットは削除され、新しいセッションはクリーンなブラウザを使用します。',
-        failedSave: '実プロファイル設定を保存できませんでした'
+        failedSave: '実プロファイル設定を保存できませんでした',
+        prompt: {
+          title: 'サイトにログインしたまま利用',
+          body: 'Hermes が既定ブラウザプロファイルのスナップショットでブラウジングできるようにすると、サイトはログイン済みの状態で開きます。',
+          bulletSnapshot: 'Cookie とログイン情報は管理されたスナップショットにコピーされます。',
+          bulletLiveProfile: '実際のブラウザプロファイルが直接開かれることはありません。',
+          bulletLocal: 'データがこのコンピュータの外に出ることはありません。',
+          dontShowAgain: '今後表示しない',
+          notNow: '今はしない',
+          enable: 'プロファイルを使用'
+        }
       }
     }
   },
@@ -1216,7 +1226,9 @@ export const ja = defineLocale({
     edit: '編集',
     archive: 'アーカイブ',
     skillArchivedTitle: 'スキルをアーカイブしました',
-    skillArchivedMessage: 'hermes curator restore で復元できます。'
+    skillArchivedMessage: 'hermes curator restore で復元できます。',
+    officialCatalog: 'インストール可能',
+    officialPill: '公式'
   },
 
   starmap: {
@@ -2430,6 +2442,8 @@ export const ja = defineLocale({
     connectedProvider: provider => `${provider} が接続されました`,
     connectedPicking: provider => `${provider} が接続されました。デフォルトモデルを選択中...`,
     signInFailed: 'サインインに失敗しました。再試行してください。',
+    signInExpired:
+      '承認待ちでタイムアウトしました。多くの場合、開いたタブのサインインページが止まっている（サーバー側の問題）ためです。そのページでサインインを完了してから再試行してください。解決しない場合は API キーまたは CLI を利用してください。',
     pickDifferentProvider: '別のプロバイダーを選択',
     signInWith: provider => `${provider} でサインイン`,
     openedBrowser: provider => `${provider} をブラウザーで開きました。`,
