@@ -401,6 +401,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "Qwen/Qwen3.5-397B-A17B": 131072, "Qwen/Qwen3.5-35B-A3B": 131072, "deepseek-ai/DeepSeek-V3.2": 65536,
     "moonshotai/Kimi-K2.5": 262144, "moonshotai/Kimi-K2.6": 262144, "moonshotai/Kimi-K2-Thinking": 262144,
     "MiniMaxAI/MiniMax-M2.5": 204800, "XiaomiMiMo/MiMo-V2-Flash": 262144,
+    "mimo-v2.6-pro-ultraspeed": 1048576, "mimo-v2.6-pro": 1048576, "mimo-v2.6-flash": 1048576,
     "mimo-v2-pro": 1048576, "mimo-v2.5-pro": 1048576, "mimo-v2.5": 1048576, "mimo-v2-omni": 262144, "mimo-v2-flash": 262144,
     "zai-org/GLM-5": 202752,
 }
@@ -2209,6 +2210,13 @@ def get_model_context_length(
     endpoint_context = _endpoint_scoped_context_length(model, base_url)
     if endpoint_context is not None:
         return endpoint_context
+    # A profile that qualifies its own bound (external processes have no /models probe) wins
+    # over the generic caches below; explicit user/endpoint overrides above still take precedence.
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider)
+    context = profile.get_model_context_length(model) if profile else None
+    if type(context) is int and context > 0:
+        return context
     is_bedrock_context = _is_bedrock_context(base_url, provider)
     # A Codex Responses route is keyed on its transport, not its host: behind a proxy
     # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
